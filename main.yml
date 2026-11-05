@@ -1,0 +1,51 @@
+name: Build VocalMixer VST3
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows
+            os: windows-latest
+          - name: macOS
+            os: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check required files
+        shell: bash
+        run: |
+          for f in CMakeLists.txt PluginProcessor.cpp PluginProcessor.h PluginEditor.cpp PluginEditor.h SpectralDucker.h BandDsp.h; do
+            test -f "$f" || { echo "::error::Missing $f in repo root"; exit 1; }
+          done
+
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Collect VST3
+        shell: bash
+        run: |
+          mkdir -p stage
+          find build -name "VocalMixer.vst3" -not -path "*/Contents/*" -exec cp -R {} stage/ \;
+          echo "Collected:"
+          ls -R stage | head -50
+
+      - name: Upload VST3
+        uses: actions/upload-artifact@v4
+        with:
+          name: VocalMixer-${{ matrix.name }}
+          path: stage
+          if-no-files-found: error
