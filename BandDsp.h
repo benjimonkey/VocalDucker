@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <complex>
 
 /** RBJ biquad coefficients (normalised, a0 = 1). */
 struct BiquadCoeffs
@@ -22,6 +23,16 @@ struct BiquadCoeffs
         const double cw = std::cos (w0), alpha = std::sin (w0) / (2.0 * q);
         const double a0 = 1.0 + alpha;
         return make ((1.0 + cw) * 0.5, -(1.0 + cw), (1.0 + cw) * 0.5, a0, -2.0 * cw, 1.0 - alpha);
+    }
+
+    /** Complex frequency response at normalised angular frequency w (radians/sample). */
+    std::complex<double> responseAt (double w) const
+    {
+        const std::complex<double> z1 = std::polar (1.0, -w);
+        const std::complex<double> z2 = std::polar (1.0, -2.0 * w);
+        const std::complex<double> num = (double) b0 + (double) b1 * z1 + (double) b2 * z2;
+        const std::complex<double> den = 1.0 + (double) a1 * z1 + (double) a2 * z2;
+        return num / den;
     }
 
 private:
@@ -64,6 +75,14 @@ struct BandPassCoeffs
         hp[1] = BiquadCoeffs::highPass (sr, lowHz, q2);
         lp[0] = BiquadCoeffs::lowPass  (sr, highHz, q1);
         lp[1] = BiquadCoeffs::lowPass  (sr, highHz, q2);
+    }
+
+    /** Magnitude (0..1) of the whole band-pass at normalised angular frequency w. */
+    float magnitudeAt (double w) const
+    {
+        const std::complex<double> h = hp[0].responseAt (w) * hp[1].responseAt (w)
+                                     * lp[0].responseAt (w) * lp[1].responseAt (w);
+        return (float) std::min (1.0, std::abs (h));
     }
 };
 

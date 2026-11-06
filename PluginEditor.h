@@ -6,7 +6,10 @@
 #include <vector>
 #include "PluginProcessor.h"
 
-/** Live FFT display: vocals in red, instruments in blue. The band-pass region is shaded. */
+/**
+    Live FFT display: vocals in red, instruments in blue, the band-pass region shaded,
+    and an amber trace showing how each frequency is currently being ducked (right-hand dB scale).
+*/
 class SpectrumDisplay : public juce::Component,
                         private juce::Timer
 {
@@ -38,6 +41,22 @@ private:
     std::array<float, numBins> vocalDb {}, instDb {};
     std::vector<float> pullBuffer;
     int idleTicks = 0;
+};
+
+/** Output of the bin gains: the gain (0 to -20 dB) applied to each FFT bin of the instruments. */
+class BinGainDisplay : public juce::Component,
+                       private juce::Timer
+{
+public:
+    explicit BinGainDisplay (VocalMixerAudioProcessor& p) : proc (p) { startTimerHz (30); }
+    ~BinGainDisplay() override { stopTimer(); }
+
+    void paint (juce::Graphics&) override;
+
+private:
+    void timerCallback() override { if (isVisible()) repaint(); }
+
+    VocalMixerAudioProcessor& proc;
 };
 
 /**
@@ -78,21 +97,25 @@ private:
     };
 
     void initKnob (Knob& k, const juce::String& paramId, const juce::String& name);
-    bool isBandMode() const;
-    void layoutKnobs (const Block& b);
+    bool isBandMode() const;     // true when the "BAND" button is selected (FFT bin mask layout)
+    void layoutKnobs (const Block& b, int extraBottom);
 
     VocalMixerAudioProcessor& proc;
     SpectrumDisplay spectrum;
+    BinGainDisplay binGains;
 
     juce::TextButton spectralButton { "SPECTRAL" }, bandButton { "BAND" };
     std::unique_ptr<juce::ParameterAttachment> modeAttachment;
 
+    juce::TextButton invertButton { "INVERT" };
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> invertAttachment;
+
     Knob lowCut, highCut;                                   // band-pass (both modes)
     Knob gateThresh, gateAttack, gateDecay;                 // noise gate (both modes)
-    Knob binThresh;                                         // Spectral: bin mask
-    Knob compThresh, compRatio, compAttack, compRelease;    // Band: compressor
-    Knob bandThresh;                                        // Band: duck threshold
-    Knob duckAmount, maxCut;                                // ducking (both modes)
+    Knob binThresh, binMaxCut;                              // "BAND": bin mask
+    Knob compThresh, compRatio, compAttack, compRelease;    // "SPECTRAL": compressor
+    Knob bandThresh;                                        // "SPECTRAL": duck threshold
+    Knob duckAmount, maxCut;                                // ducking (maxCut: "SPECTRAL")
     Knob vocalLevel, instLevel;                             // output: per-channel gain before the sum
 
     std::vector<Block> blocks;

@@ -3,6 +3,20 @@
 
 using namespace juce;
 
+/*
+    MODES (label shown on the GUI -> what it does)
+
+      "Spectral" (parameter index 0, the default):
+          vocal -> noise gate -> band-pass -> compressor -> [band power] -> gain
+          The band power ducks the instrument channel, but ONLY the frequencies passed by the
+          band-pass filter (done with per-bin gains in the 512-pt ducker, so the instruments are
+          never filtered).
+
+      "Band" (parameter index 1):
+          vocal -> band-pass -> noise gate -> FFT bin mask (optionally inverted)
+          Bins used by the vocal duck the same bins of the instruments, limited to the band-pass range.
+*/
+
 VocalMixerAudioProcessor::VocalMixerAudioProcessor()
     : AudioProcessor (BusesProperties()
                           .withInput  ("Instruments", AudioChannelSet::stereo(), true)   // Stereo Input 1
@@ -15,6 +29,8 @@ VocalMixerAudioProcessor::VocalMixerAudioProcessor()
     pGateAttack  = apvts.getRawParameterValue ("gateAttack");
     pGateDecay   = apvts.getRawParameterValue ("gateDecay");
     pBinThresh   = apvts.getRawParameterValue ("binThresh");
+    pBinMaxCut   = apvts.getRawParameterValue ("binMaxCut");
+    pBinInvert   = apvts.getRawParameterValue ("binInvert");
     pDuckAmount  = apvts.getRawParameterValue ("duckAmount");
     pMaxCut      = apvts.getRawParameterValue ("maxCut");
     pVocalLevel  = apvts.getRawParameterValue ("vocalLevel");
@@ -37,6 +53,7 @@ AudioProcessorValueTreeState::ParameterLayout VocalMixerAudioProcessor::createLa
 
     AudioProcessorValueTreeState::ParameterLayout layout;
 
+    // Index 0 = "Spectral" (default), index 1 = "Band"
     layout.add (std::make_unique<AudioParameterChoice> (ParameterID { "mode", 1 }, "Mode",
                                                         StringArray { "Spectral", "Band" }, 0));
 
@@ -54,11 +71,14 @@ AudioProcessorValueTreeState::ParameterLayout VocalMixerAudioProcessor::createLa
     layout.add (std::make_unique<P> (ParameterID { "gateDecay", 1 }, "Gate Decay",
                                      NormalisableRange<float> (5.0f, 1000.0f, 0.1f, 0.4f), 150.0f, A().withLabel ("ms")));
 
-    // --- Spectral mode ---
+    // --- "Band" mode: FFT bin mask ---
     layout.add (std::make_unique<P> (ParameterID { "binThresh", 1 }, "Bin Threshold",
                                      NormalisableRange<float> (-100.0f, -10.0f, 0.1f), -55.0f, A().withLabel ("dB")));
+    layout.add (std::make_unique<P> (ParameterID { "binMaxCut", 1 }, "Bin Max Cut",     // mask gain range: -20 .. 0 dB
+                                     NormalisableRange<float> (0.0f, 20.0f, 0.1f), 12.0f, A().withLabel ("dB")));
+    layout.add (std::make_unique<AudioParameterBool> (ParameterID { "binInvert", 1 }, "Bin Mask Invert", false));
 
-    // --- Band mode: compressor on the filtered vocal, and the power threshold for ducking ---
+    // --- "Spectral" mode: compressor on the filtered vocal, and the power threshold for ducking ---
     layout.add (std::make_unique<P> (ParameterID { "compThresh", 1 }, "Comp Threshold",
                                      NormalisableRange<float> (-60.0f, 0.0f, 0.1f), -18.0f, A().withLabel ("dB")));
     layout.add (std::make_unique<P> (ParameterID { "compRatio", 1 }, "Comp Ratio",
@@ -70,13 +90,13 @@ AudioProcessorValueTreeState::ParameterLayout VocalMixerAudioProcessor::createLa
     layout.add (std::make_unique<P> (ParameterID { "bandThresh", 1 }, "Band Threshold",
                                      NormalisableRange<float> (-80.0f, 0.0f, 0.1f), -40.0f, A().withLabel ("dB")));
 
-    // --- Ducking (both modes) ---
+    // --- Ducking ---
     layout.add (std::make_unique<P> (ParameterID { "duckAmount", 1 }, "Duck Amount",
                                      NormalisableRange<float> (0.0f, 1.0f, 0.001f), 0.7f));
     layout.add (std::make_unique<P> (ParameterID { "maxCut", 1 }, "Max Cut",
                                      NormalisableRange<float> (0.0f, 36.0f, 0.1f), 12.0f, A().withLabel ("dB")));
 
-    // --- Output gain stages: vocal and instrument levels, applied before the sum (both modes) ---
+    // --- Output gain stages: vocal and instrument levels, applied before the sum ---
     layout.add (std::make_unique<P> (ParameterID { "vocalLevel", 1 }, "Vocal Gain",
                                      NormalisableRange<float> (-60.0f, 12.0f, 0.1f), 0.0f, A().withLabel ("dB")));
     layout.add (std::make_unique<P> (ParameterID { "instLevel", 1 }, "Instrument Gain",
@@ -104,11 +124,9 @@ void VocalMixerAudioProcessor::resetDspState()
     compressor.reset();
     for (auto& f : vocalBp) f.reset();
 
-    for (auto& d : vocalDelay)   std::fill (d.begin(), d.end(), 0.0f);
-    for (auto& d : bandOutDelay) std::fill (d.begin(), d.end(), 0.0f);
+    for (auto& d : vocalDelay) std::fill (d.begin(), d.end(), 0.0f);
 
     delayPos = 0;
-    outDelayPos = 0;
     bandEnv = 0.0f;
     gateEnv = 0.0f;
     gateGain = 0.0f;
@@ -122,11 +140,11 @@ void VocalMixerAudioProcessor::prepareToPlay (double newSampleRate, int)
 
     ducker.prepare (sampleRate);
 
-    for (auto& d : vocalDelay)   d.assign ((size_t) SpectralDucker::latencySamples, 0.0f);
-    for (auto& d : bandOutDelay) d.assign ((size_t) SpectralDucker::latencySamples, 0.0f);
+    for (auto& d : vocalDelay) d.assign ((size_t) SpectralDucker::latencySamples, 0.0f);
 
     resetDspState();
     lastMode = (int) (pMode->load() + 0.5f);
+    lastBpLo = lastBpHi = -1.0f;      // force the band mask to be rebuilt for the new sample rate
 
     vocalGainSmoothed.reset (sampleRate, 0.02);
     instGainSmoothed.reset (sampleRate, 0.02);
@@ -176,21 +194,34 @@ void VocalMixerAudioProcessor::processBlock (AudioBuffer<float>& buffer, MidiBuf
         }
     }
 
-    // ---- Mode ----
-    const int mode = (int) (pMode->load() + 0.5f);   // 0 = Spectral, 1 = Band
+    // ---- Mode: 0 = "Spectral" (band-power duck), 1 = "Band" (vocal bin mask) ----
+    const int mode = (int) (pMode->load() + 0.5f);
     if (mode != lastMode)
     {
         resetDspState();
         lastMode = mode;
     }
+    ducker.setMode (mode == 0 ? SpectralDucker::Mode::fixedBand : SpectralDucker::Mode::vocalMask);
 
-    // ---- Band-pass filter (used in both modes) ----
+    // ---- Band-pass filter (both modes) and its magnitude response per FFT bin ----
     {
         float lo = pBandLow->load();
         float hi = std::max (pBandHigh->load(), lo * 1.2f);
         hi = std::min (hi, 0.45f * (float) sampleRate);
         lo = std::min (lo, hi / 1.2f);
         bpCoeffs.set (sampleRate, lo, hi);
+
+        if (lo != lastBpLo || hi != lastBpHi)
+        {
+            lastBpLo = lo;
+            lastBpHi = hi;
+
+            std::array<float, SpectralDucker::numBins> m {};
+            for (int k = 0; k < SpectralDucker::numBins; ++k)
+                m[(size_t) k] = bpCoeffs.magnitudeAt (MathConstants<double>::twoPi * (double) k / (double) SpectralDucker::fftSize);
+
+            ducker.setBandMask (m.data());   // ducking is limited to the frequencies the filter passes
+        }
     }
 
     // ---- Noise gate parameters ----
@@ -226,51 +257,9 @@ void VocalMixerAudioProcessor::processBlock (AudioBuffer<float>& buffer, MidiBuf
     if (mode == 0)
     {
         //======================================================================
-        // SPECTRAL MODE:  (vocal = Input 2, instruments = Input 1)
-        //   vocal -> band-pass -> noise gate -> FFT bin mask
-        //   bins used by the vocal duck the same bins of the instruments
-        //======================================================================
-        ducker.setParameters (pBinThresh->load(), pDuckAmount->load(), pMaxCut->load());
-
-        for (int i = 0; i < numSamples; ++i)
-        {
-            const float il = iL[i];                          // read before the output overwrites input 1
-            const float ir = iR[i];
-            const float vl = haveVocal ? vL[i] : 0.0f;
-            const float vr = haveVocal ? vR[i] : 0.0f;
-
-            // Band-pass BEFORE the gate
-            const float fl = vocalBp[0].process (bpCoeffs, vl);
-            const float fr = vocalBp[1].process (bpCoeffs, vr);
-
-            float gl, gr;
-            runGate (fl, fr, gl, gr);
-
-            // Latency-matched vocal path
-            const float dl = vocalDelay[0][(size_t) delayPos];
-            const float dr = vocalDelay[1][(size_t) delayPos];
-            vocalDelay[0][(size_t) delayPos] = gl;
-            vocalDelay[1][(size_t) delayPos] = gr;
-            if (++delayPos >= delayLen) delayPos = 0;
-
-            ducker.setGate (gateGain);
-            float xl, xr;
-            ducker.processSample (0.5f * (gl + gr), il, ir, xl, xr);
-
-            const float vg = vocalGainSmoothed.getNextValue();
-            const float ig = instGainSmoothed.getNextValue();
-            oL[i] = xl * ig + dl * vg;
-            oR[i] = xr * ig + dr * vg;
-        }
-
-        duckMeterDb.store (0.0f);
-    }
-    else
-    {
-        //======================================================================
-        // BAND MODE:
-        //   vocal -> noise gate -> band-pass -> compressor -> [measure band power]
-        //   -> gain -> output.  The measured power ducks the whole (unfiltered) instrument channel.
+        // "SPECTRAL" MODE
+        //   vocal -> noise gate -> band-pass -> compressor -> [measure band power] -> gain
+        //   The measured power ducks ONLY the band-pass range of the instrument channel.
         //======================================================================
         compressor.setParams (sampleRate, pCompThresh->load(), pCompRatio->load(),
                               pCompAttack->load(), pCompRelease->load());
@@ -310,27 +299,70 @@ void VocalMixerAudioProcessor::processBlock (AudioBuffer<float>& buffer, MidiBuf
             const float levelDb = 10.0f * std::log10 (bandEnv + 1.0e-12f);
             const float depth = jlimit (0.0f, 1.0f, (levelDb - bandThrDb) / rangeDb);
             cutDb = duckAmt * maxCutDb * depth;
-            const float g = std::exp (-cutDb * 0.11512925f);
+            ducker.setBandGain (std::exp (-cutDb * 0.11512925f));
 
-            // Duck the (unfiltered) instrument channel by the measured band power
-            const float xl = il * g;
-            const float xr = ir * g;
+            // Latency-matched vocal path
+            const float dl = vocalDelay[0][(size_t) delayPos];
+            const float dr = vocalDelay[1][(size_t) delayPos];
+            vocalDelay[0][(size_t) delayPos] = cl;
+            vocalDelay[1][(size_t) delayPos] = cr;
+            if (++delayPos >= delayLen) delayPos = 0;
+
+            // Instruments through the ducker (vocal input is not used in this mode)
+            float xl, xr;
+            ducker.setGate (gateGain);
+            ducker.processSample (0.0f, il, ir, xl, xr);
 
             // Per-channel gain stages, then sum
             const float vg = vocalGainSmoothed.getNextValue();
             const float ig = instGainSmoothed.getNextValue();
-            const float sumL = xl * ig + cl * vg;
-            const float sumR = xr * ig + cr * vg;
-
-            // Same latency as Spectral mode so the host's delay compensation never changes
-            oL[i] = bandOutDelay[0][(size_t) outDelayPos];
-            oR[i] = bandOutDelay[1][(size_t) outDelayPos];
-            bandOutDelay[0][(size_t) outDelayPos] = sumL;
-            bandOutDelay[1][(size_t) outDelayPos] = sumR;
-            if (++outDelayPos >= delayLen) outDelayPos = 0;
+            oL[i] = xl * ig + dl * vg;
+            oR[i] = xr * ig + dr * vg;
         }
 
         duckMeterDb.store (cutDb);
+    }
+    else
+    {
+        //======================================================================
+        // "BAND" MODE
+        //   vocal -> band-pass -> noise gate -> FFT bin mask (optionally inverted)
+        //   Bins used by the vocal duck the same bins of the instruments (within the band-pass range).
+        //======================================================================
+        ducker.setParameters (pBinThresh->load(), pDuckAmount->load(), pBinMaxCut->load(), pBinInvert->load() > 0.5f);
+
+        for (int i = 0; i < numSamples; ++i)
+        {
+            const float il = iL[i];                          // read before the output overwrites input 1
+            const float ir = iR[i];
+            const float vl = haveVocal ? vL[i] : 0.0f;
+            const float vr = haveVocal ? vR[i] : 0.0f;
+
+            // Band-pass BEFORE the gate
+            const float fl = vocalBp[0].process (bpCoeffs, vl);
+            const float fr = vocalBp[1].process (bpCoeffs, vr);
+
+            float gl, gr;
+            runGate (fl, fr, gl, gr);
+
+            // Latency-matched vocal path
+            const float dl = vocalDelay[0][(size_t) delayPos];
+            const float dr = vocalDelay[1][(size_t) delayPos];
+            vocalDelay[0][(size_t) delayPos] = gl;
+            vocalDelay[1][(size_t) delayPos] = gr;
+            if (++delayPos >= delayLen) delayPos = 0;
+
+            ducker.setGate (gateGain);
+            float xl, xr;
+            ducker.processSample (0.5f * (gl + gr), il, ir, xl, xr);
+
+            const float vg = vocalGainSmoothed.getNextValue();
+            const float ig = instGainSmoothed.getNextValue();
+            oL[i] = xl * ig + dl * vg;
+            oR[i] = xr * ig + dr * vg;
+        }
+
+        duckMeterDb.store (0.0f);
     }
 
     gateGainMeter.store (gateGain);

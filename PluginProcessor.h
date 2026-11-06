@@ -71,10 +71,13 @@ public:
 
     juce::AudioProcessorValueTreeState apvts;
 
+    /** Per-bin gain (dB) currently applied to the instruments, for the GUI displays. */
+    const std::array<std::atomic<float>, SpectralDucker::numBins>& getBinGainDisplay() const { return ducker.displayGainDb; }
+
     // Display plumbing (audio thread writes, editor reads)
     ScopeFifo vocalScope, instScope;
     std::atomic<float> gateGainMeter { 0.0f };
-    std::atomic<float> duckMeterDb { 0.0f };       // Band mode: current instrument-band cut in dB
+    std::atomic<float> duckMeterDb { 0.0f };       // band-power duck: current cut in dB
     std::atomic<double> currentSampleRate { 44100.0 };
 
 private:
@@ -85,6 +88,8 @@ private:
     std::atomic<float>* pGateAttack = nullptr;
     std::atomic<float>* pGateDecay = nullptr;
     std::atomic<float>* pBinThresh = nullptr;
+    std::atomic<float>* pBinMaxCut = nullptr;
+    std::atomic<float>* pBinInvert = nullptr;
     std::atomic<float>* pDuckAmount = nullptr;
     std::atomic<float>* pMaxCut = nullptr;
     std::atomic<float>* pVocalLevel = nullptr;
@@ -106,17 +111,16 @@ private:
     float gateEnv = 0.0f, gateGain = 0.0f;
     bool gateOpen = false;
 
-    // Spectral mode: vocal delay line (compensates the STFT latency of the instrument path)
+    // Vocal delay line (compensates the STFT latency of the instrument path)
     std::array<std::vector<float>, 2> vocalDelay;
     int delayPos = 0;
 
-    // Band mode
+    // Vocal band-pass / compressor / band power
     BandPassCoeffs bpCoeffs;
-    std::array<BandPassChannel, 2> vocalBp;            // vocal only: the instrument channel is not filtered
+    std::array<BandPassChannel, 2> vocalBp;            // vocal only: the instrument channel is never filtered
     Compressor compressor;
-    float bandEnv = 0.0f;                              // smoothed power of the band-passed vocal
-    std::array<std::vector<float>, 2> bandOutDelay;    // keeps latency identical in both modes
-    int outDelayPos = 0;
+    float bandEnv = 0.0f;                              // smoothed power of the compressed band-passed vocal
+    float lastBpLo = -1.0f, lastBpHi = -1.0f;          // detects band-pass changes to refresh the bin band mask
 
     juce::SmoothedValue<float, juce::ValueSmoothingTypes::Linear> vocalGainSmoothed, instGainSmoothed;
 

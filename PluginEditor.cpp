@@ -10,11 +10,19 @@ namespace
     constexpr int kLaneH = 150;        // height of a knob block
     constexpr int kGapV = 44;          // vertical gap between the two lanes
     constexpr int kTextBlockH = 80;    // height of blocks without knobs
+    constexpr int kInvertRoom = 28;    // space reserved at the bottom of the bin mask block for the INVERT button
 
     const Colour vocalColour   (0xffff5a50);
     const Colour instColour    (0xff4a90ff);
     const Colour neutralColour (0xff9aa3ad);
     const Colour controlColour (0xffe8a33d);
+
+    float freqToXLog (float freq, Rectangle<float> area)
+    {
+        const float lo = std::log10 (20.0f), hi = std::log10 (20000.0f);
+        const float t = (std::log10 (jlimit (20.0f, 20000.0f, freq)) - lo) / (hi - lo);
+        return area.getX() + t * area.getWidth();
+    }
 
     void drawFlowArrow (Graphics& g, Point<float> a, Point<float> b, Colour c, bool dashed)
     {
@@ -122,9 +130,7 @@ void SpectrumDisplay::timerCallback()
 
 float SpectrumDisplay::freqToX (float freq, Rectangle<float> area) const
 {
-    const float lo = std::log10 (20.0f), hi = std::log10 (20000.0f);
-    const float t = (std::log10 (jlimit (20.0f, 20000.0f, freq)) - lo) / (hi - lo);
-    return area.getX() + t * area.getWidth();
+    return freqToXLog (freq, area);
 }
 
 Path SpectrumDisplay::makePath (const std::array<float, numBins>& db, Rectangle<float> area) const
@@ -191,7 +197,10 @@ void SpectrumDisplay::paint (Graphics& g)
         g.drawVerticalLine ((int) x2, area.getY(), area.getBottom());
     }
 
-    // Spectra (instruments underneath, vocals on top)
+    // Duck-trace scale: 0 dB at the top of the plot, -range dB at the bottom
+    const bool binMode = proc.apvts.getRawParameterValue ("mode")->load() > 0.5f;   // "BAND" button
+    const float gainRange = binMode ? 20.0f : 36.0f;
+
     {
         Graphics::ScopedSaveState state (g);
         g.reduceClipRegion (area.toNearestInt());
@@ -214,9 +223,42 @@ void SpectrumDisplay::paint (Graphics& g)
 
         drawSpectrum (instDb,  Colour (0xff3b8cff));   // blue - instruments
         drawSpectrum (vocalDb, Colour (0xffff3b3b));   // red  - vocals
+
+        // Amber trace: how each frequency is being ducked right now
+        const float sr = (float) proc.currentSampleRate.load();
+        const auto& gains = proc.getBinGainDisplay();
+        Path trace;
+        bool started = false;
+
+        for (int k = 1; k < SpectralDucker::numBins; ++k)
+        {
+            const float f = (float) k * sr / (float) SpectralDucker::fftSize;
+            if (f < 20.0f) continue;
+            if (f > 20000.0f) break;
+
+            const float gDb = jlimit (-gainRange, 0.0f, gains[(size_t) k].load (std::memory_order_relaxed));
+            const float x = freqToX (f, area);
+            const float y = jmap (gDb, -gainRange, 0.0f, area.getBottom(), area.getY());
+
+            if (! started) { trace.startNewSubPath (x, y); started = true; }
+            else           trace.lineTo (x, y);
+        }
+
+        g.setColour (controlColour);
+        g.strokePath (trace, PathStrokeType (2.0f));
     }
 
-    // Legend (right to left: gate light, instruments, vocals) - spaced so nothing overlaps
+    // Right-hand scale for the duck trace
+    g.setColour (controlColour.withAlpha (0.85f));
+    g.setFont (11.0f);
+    for (float frac : { 0.0f, 0.5f, 1.0f })
+    {
+        const float db = -gainRange * frac;
+        const float y = jmap (db, -gainRange, 0.0f, area.getBottom(), area.getY());
+        g.drawText (String ((int) db), (int) area.getRight() + 2, (int) y - 7, 32, 14, Justification::centredLeft, false);
+    }
+
+    // Legend (right to left: gate light, instruments, vocals, duck trace) - spaced so nothing overlaps
     const int w = getWidth();
     g.setFont (12.0f);
 
@@ -230,8 +272,10 @@ void SpectrumDisplay::paint (Graphics& g)
     g.drawText ("Instruments", w - 174, 8, 90, 16, Justification::centredRight, false);
     g.setColour (Colour (0xffff3b3b));
     g.drawText ("Vocals", w - 244, 8, 60, 16, Justification::centredRight, false);
+    g.setColour (controlColour);
+    g.drawText ("Duck gain (dB)", w - 354, 8, 100, 16, Justification::centredRight, false);
 
-    if (proc.apvts.getRawParameterValue ("mode")->load() > 0.5f)
+    if (! binMode)
     {
         g.setColour (controlColour);
         g.drawText ("Band duck: -" + String (proc.duckMeterDb.load(), 1) + " dB",
@@ -240,12 +284,92 @@ void SpectrumDisplay::paint (Graphics& g)
 }
 
 //==============================================================================
+// BinGainDisplay
+//==============================================================================
+void BinGainDisplay::paint (Graphics& g)
+{
+    auto bounds = getLocalBounds().toFloat();
+    g.setColour (Colour (0xff101418));
+    g.fillRoundedRectangle (bounds, 6.0f);
+
+    auto area = bounds.reduced (34.0f, 16.0f);
+    area.removeFromBottom (6.0f);
+
+    constexpr float rangeDb = 20.0f;
+    auto yOf = [&] (float db)
+    {
+        return jmap (jlimit (-rangeDb, 0.0f, db), -rangeDb, 0.0f, area.getBottom(), area.getY());
+    };
+
+    // Grid
+    g.setFont (11.0f);
+    for (float db : { 0.0f, -5.0f, -10.0f, -15.0f, -20.0f })
+    {
+        const float y = yOf (db);
+        g.setColour (Colours::white.withAlpha (0.08f));
+        g.drawHorizontalLine ((int) y, area.getX(), area.getRight());
+        g.setColour (Colours::white.withAlpha (0.45f));
+        g.drawText (String ((int) db), Rectangle<float> (0.0f, y - 7.0f, 30.0f, 14.0f), Justification::centredRight);
+    }
+
+    for (float f : { 100.0f, 1000.0f, 10000.0f })
+    {
+        const float x = freqToXLog (f, area);
+        g.setColour (Colours::white.withAlpha (0.08f));
+        g.drawVerticalLine ((int) x, area.getY(), area.getBottom());
+        g.setColour (Colours::white.withAlpha (0.45f));
+        const String txt = f >= 1000.0f ? String ((int) (f / 1000.0f)) + "k" : String ((int) f);
+        g.drawText (txt, Rectangle<float> (x - 20.0f, area.getBottom() - 1.0f, 40.0f, 14.0f), Justification::centred);
+    }
+
+    // Bin gains: the area between 0 dB and the gain curve is the amount of ducking
+    const float sr = (float) proc.currentSampleRate.load();
+    const auto& gains = proc.getBinGainDisplay();
+
+    Path curve;
+    bool started = false;
+    float firstX = 0.0f, lastX = 0.0f;
+
+    for (int k = 1; k < SpectralDucker::numBins; ++k)
+    {
+        const float f = (float) k * sr / (float) SpectralDucker::fftSize;
+        if (f < 20.0f) continue;
+        if (f > 20000.0f) break;
+
+        const float x = freqToXLog (f, area);
+        const float y = yOf (gains[(size_t) k].load (std::memory_order_relaxed));
+
+        if (! started) { curve.startNewSubPath (x, y); firstX = x; started = true; }
+        else           curve.lineTo (x, y);
+        lastX = x;
+    }
+
+    if (started)
+    {
+        Path fill (curve);
+        fill.lineTo (lastX, yOf (0.0f));
+        fill.lineTo (firstX, yOf (0.0f));
+        fill.closeSubPath();
+
+        g.setColour (controlColour.withAlpha (0.25f));
+        g.fillPath (fill);
+        g.setColour (controlColour);
+        g.strokePath (curve, PathStrokeType (1.8f));
+    }
+
+    g.setColour (Colours::white.withAlpha (0.6f));
+    g.setFont (12.0f);
+    g.drawText ("BIN GAINS (dB)", 40, 1, 200, 14, Justification::centredLeft, false);
+}
+
+//==============================================================================
 // Editor
 //==============================================================================
 VocalMixerAudioProcessorEditor::VocalMixerAudioProcessorEditor (VocalMixerAudioProcessor& p)
-    : AudioProcessorEditor (&p), proc (p), spectrum (p)
+    : AudioProcessorEditor (&p), proc (p), spectrum (p), binGains (p)
 {
     addAndMakeVisible (spectrum);
+    addChildComponent (binGains);
 
     initKnob (lowCut,      "bandLow",     "Low Cut");
     initKnob (highCut,     "bandHigh",    "High Cut");
@@ -253,6 +377,7 @@ VocalMixerAudioProcessorEditor::VocalMixerAudioProcessorEditor (VocalMixerAudioP
     initKnob (gateAttack,  "gateAttack",  "Attack");
     initKnob (gateDecay,   "gateDecay",   "Decay");
     initKnob (binThresh,   "binThresh",   "Bin Thresh");
+    initKnob (binMaxCut,   "binMaxCut",   "Max Cut");
     initKnob (compThresh,  "compThresh",  "Threshold");
     initKnob (compRatio,   "compRatio",   "Ratio");
     initKnob (compAttack,  "compAttack",  "Attack");
@@ -262,6 +387,15 @@ VocalMixerAudioProcessorEditor::VocalMixerAudioProcessorEditor (VocalMixerAudioP
     initKnob (maxCut,      "maxCut",      "Max Cut");
     initKnob (vocalLevel,  "vocalLevel",  "Vocal Gain");
     initKnob (instLevel,   "instLevel",   "Inst Gain");
+
+    // Bin mask INVERT button
+    invertButton.setClickingTogglesState (true);
+    invertButton.setColour (TextButton::buttonColourId, Colour (0xff2b323b));
+    invertButton.setColour (TextButton::buttonOnColourId, controlColour);
+    invertButton.setColour (TextButton::textColourOffId, Colours::white.withAlpha (0.8f));
+    invertButton.setColour (TextButton::textColourOnId, Colour (0xff1a1f26));
+    addChildComponent (invertButton);
+    invertAttachment = std::make_unique<AudioProcessorValueTreeState::ButtonAttachment> (proc.apvts, "binInvert", invertButton);
 
     // Mode switch: a two-position segmented switch bound to the "mode" parameter
     for (auto* b : { &spectralButton, &bandButton })
@@ -289,7 +423,7 @@ VocalMixerAudioProcessorEditor::VocalMixerAudioProcessorEditor (VocalMixerAudioP
         });
     modeAttachment->sendInitialUpdate();
 
-    setSize (1000, 630);
+    setSize (1000, 660);
 }
 
 bool VocalMixerAudioProcessorEditor::isBandMode() const
@@ -314,7 +448,7 @@ void VocalMixerAudioProcessorEditor::initKnob (Knob& k, const String& paramId, c
     k.attachment = std::make_unique<AudioProcessorValueTreeState::SliderAttachment> (proc.apvts, paramId, k.slider);
 }
 
-void VocalMixerAudioProcessorEditor::layoutKnobs (const Block& b)
+void VocalMixerAudioProcessorEditor::layoutKnobs (const Block& b, int extraBottom)
 {
     const int n = (int) b.knobs.size();
     int x = b.bounds.getX() + (b.bounds.getWidth() - n * kCell) / 2;
@@ -322,7 +456,7 @@ void VocalMixerAudioProcessorEditor::layoutKnobs (const Block& b)
     for (auto* k : b.knobs)
     {
         k->label.setBounds (x, b.bounds.getY() + 42, kCell, 16);
-        k->slider.setBounds (x, b.bounds.getY() + 58, kCell, kLaneH - 62);
+        k->slider.setBounds (x, b.bounds.getY() + 58, kCell, kLaneH - 62 - extraBottom);
         k->label.setVisible (true);
         k->slider.setVisible (true);
         x += kCell;
@@ -331,7 +465,8 @@ void VocalMixerAudioProcessorEditor::layoutKnobs (const Block& b)
 
 void VocalMixerAudioProcessorEditor::resized()
 {
-    const bool band = isBandMode();
+    // The "BAND" button selects the FFT bin-mask layout; the "SPECTRAL" button selects the band-power layout
+    const bool binLayout = isBandMode();
 
     auto area = getLocalBounds();
     area.removeFromTop (44);
@@ -339,7 +474,21 @@ void VocalMixerAudioProcessorEditor::resized()
     spectralButton.setBounds (150, 9, 96, 26);
     bandButton.setBounds (246, 9, 96, 26);
 
-    spectrum.setBounds (area.removeFromTop (210).reduced (14, 0));
+    // Displays: the spectrum, plus the bin gain display underneath in the bin-mask layout
+    auto displays = area.removeFromTop (240).reduced (14, 0);
+    if (binLayout)
+    {
+        spectrum.setBounds (displays.removeFromTop (150));
+        displays.removeFromTop (6);
+        binGains.setBounds (displays);
+        binGains.setVisible (true);
+    }
+    else
+    {
+        spectrum.setBounds (displays);
+        binGains.setVisible (false);
+    }
+
     area.removeFromTop (10);
     const auto lanes = area.reduced (14, 0);
 
@@ -350,13 +499,14 @@ void VocalMixerAudioProcessorEditor::resized()
     const int outW = kCell + 2 * kPad;
     auto knobsWidth = [] (int n) { return n * kCell + 2 * kPad; };
 
-    // Hide every knob; the blocks of the current mode switch theirs back on
-    for (auto* k : { &lowCut, &highCut, &gateThresh, &gateAttack, &gateDecay, &binThresh, &compThresh,
+    // Hide every control; the blocks of the current layout switch theirs back on
+    for (auto* k : { &lowCut, &highCut, &gateThresh, &gateAttack, &gateDecay, &binThresh, &binMaxCut, &compThresh,
                      &compRatio, &compAttack, &compRelease, &bandThresh, &duckAmount, &maxCut, &vocalLevel, &instLevel })
     {
         k->slider.setVisible (false);
         k->label.setVisible (false);
     }
+    invertButton.setVisible (false);
 
     blocks.clear();
     arrows.clear();
@@ -373,7 +523,7 @@ void VocalMixerAudioProcessorEditor::resized()
     };
 
     auto make = [&] (int x, int w, int laneY, const String& title, const String& sub,
-                     Colour c, std::vector<Knob*> knobs) -> int
+                     Colour c, std::vector<Knob*> knobs, int extraBottom) -> int
     {
         Block b;
         b.title = title;
@@ -384,7 +534,7 @@ void VocalMixerAudioProcessorEditor::resized()
         const int h = b.textOnly ? kTextBlockH : kLaneH;
         b.bounds = Rectangle<int> (x, laneY + (kLaneH - h) / 2, w, h);
         blocks.push_back (std::move (b));
-        layoutKnobs (blocks.back());
+        layoutKnobs (blocks.back(), extraBottom);
         return (int) blocks.size() - 1;
     };
 
@@ -432,45 +582,50 @@ void VocalMixerAudioProcessorEditor::resized()
         return (int) blocks.size() - 1;
     };
 
-    if (! band)
+    if (binLayout)
     {
         //----------------------------------------------------------------------
-        // SPECTRAL: Vocal in > Band-pass > Noise gate > Bin mask  (control) FFT duck < Inst in
+        // "BAND": Vocal in > Band-pass > Noise gate > Bin mask (+INVERT)  (control) FFT duck < Inst in
         //----------------------------------------------------------------------
         const int wBpf = knobsWidth (2), wGate = knobsWidth (3), wMask = knobsWidth (1);
         const auto xs = distribute ({ kTagW, wBpf, wGate, wMask, outW });
 
-        const int tagV  = make (xs[0], kTagW, laneAy, "VOCAL IN", "input 2", neutralColour, {});
-        const int bpf   = make (xs[1], wBpf,  laneAy, "BAND-PASS", "before gate", vocalColour, { &lowCut, &highCut });
-        const int gate  = make (xs[2], wGate, laneAy, "NOISE GATE", "vocal channel", vocalColour, { &gateThresh, &gateAttack, &gateDecay });
-        const int mask  = make (xs[3], wMask, laneAy, "BIN MASK", "bins in use", vocalColour, { &binThresh });
+        const int tagV = make (xs[0], kTagW, laneAy, "VOCAL IN", "input 2", neutralColour, {}, 0);
+        const int bpf  = make (xs[1], wBpf,  laneAy, "BAND-PASS", "before gate", vocalColour, { &lowCut, &highCut }, 0);
+        const int gate = make (xs[2], wGate, laneAy, "NOISE GATE", "vocal channel", vocalColour, { &gateThresh, &gateAttack, &gateDecay }, 0);
+        const int mask = make (xs[3], wMask, laneAy, "BIN MASK", "bins in use", vocalColour, { &binThresh }, kInvertRoom);
 
-        const int tagI  = make (xs[0], kTagW, laneBy, "INST. IN", "input 1", neutralColour, {});
-        const int duck  = make (xs[2], xs[3] + wMask - xs[2], laneBy, "FFT DUCK",
-                                String (SpectralDucker::fftSize) + "-pt FFT, 75% overlap", instColour, { &duckAmount, &maxCut });
+        const int tagI = make (xs[0], kTagW, laneBy, "INST. IN", "input 1", neutralColour, {}, 0);
+        const int duck = make (xs[2], xs[3] + wMask - xs[2], laneBy, "FFT DUCK",
+                               String (SpectralDucker::fftSize) + "-pt FFT, within the band-pass range",
+                               instColour, { &duckAmount, &binMaxCut }, 0);
 
         const int out = makeOutput (xs[4]);
 
         flow (tagV, bpf, cyA);  flow (bpf, gate, cyA);  flow (gate, mask, cyA);  flow (mask, out, cyA);
         flow (tagI, duck, cyB); flow (duck, out, cyB);
         control (mask, duck, "bin gains");
+
+        const auto& mb = blocks[(size_t) mask].bounds;
+        invertButton.setBounds (mb.getCentreX() - 35, mb.getBottom() - kInvertRoom, 70, 22);
+        invertButton.setVisible (true);
     }
     else
     {
         //----------------------------------------------------------------------
-        // BAND: Vocal in > Noise gate > Band-pass > Compressor (tap: band power) > Gain > Out
-        //       Inst in > Duck (whole channel, no filter; driven by the band power tap)
+        // "SPECTRAL": Vocal in > Noise gate > Band-pass > Compressor (tap: band power) > Gain > Out
+        //             Inst in > Duck (only the band-pass range; driven by the band power tap)
         //----------------------------------------------------------------------
         const int wGate = knobsWidth (3), wBpf = knobsWidth (2), wComp = knobsWidth (4);
         const auto xs = distribute ({ kTagW, wGate, wBpf, wComp, outW });
 
-        const int tagV = make (xs[0], kTagW, laneAy, "VOCAL IN", "input 2", neutralColour, {});
-        const int gate = make (xs[1], wGate, laneAy, "NOISE GATE", "vocal channel", vocalColour, { &gateThresh, &gateAttack, &gateDecay });
-        const int bpf  = make (xs[2], wBpf,  laneAy, "BAND-PASS", "after gate", vocalColour, { &lowCut, &highCut });
-        const int comp = make (xs[3], wComp, laneAy, "COMPRESSOR", "post band-pass", vocalColour, { &compThresh, &compRatio, &compAttack, &compRelease });
+        const int tagV = make (xs[0], kTagW, laneAy, "VOCAL IN", "input 2", neutralColour, {}, 0);
+        const int gate = make (xs[1], wGate, laneAy, "NOISE GATE", "vocal channel", vocalColour, { &gateThresh, &gateAttack, &gateDecay }, 0);
+        const int bpf  = make (xs[2], wBpf,  laneAy, "BAND-PASS", "after gate", vocalColour, { &lowCut, &highCut }, 0);
+        const int comp = make (xs[3], wComp, laneAy, "COMPRESSOR", "post band-pass", vocalColour, { &compThresh, &compRatio, &compAttack, &compRelease }, 0);
 
-        const int tagI = make (xs[0], kTagW, laneBy, "INST. IN", "input 1", neutralColour, {});
-        const int duck = make (xs[3], wComp, laneBy, "DUCK", "full channel, by band power", instColour, { &bandThresh, &duckAmount, &maxCut });
+        const int tagI = make (xs[0], kTagW, laneBy, "INST. IN", "input 1", neutralColour, {}, 0);
+        const int duck = make (xs[3], wComp, laneBy, "DUCK", "only the band-pass range", instColour, { &bandThresh, &duckAmount, &maxCut }, 0);
 
         const int out = makeOutput (xs[4]);
 

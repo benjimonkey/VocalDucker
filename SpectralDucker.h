@@ -3,16 +3,23 @@
 #include <juce_dsp/juce_dsp.h>
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 
 /**
-    Frequency-domain processor (512-point STFT, 75 % overlap).
+    Frequency-domain ducker for the instrument channel (512-point STFT, 75 % overlap).
 
-    The (band-passed, gated) vocal signal is analysed with an STFT. Every FFT bin whose
-    level is above the bin threshold is marked as "used by the vocal". The same bins
-    of the instrument signal are then attenuated by `amount` (up to `maxCutDb`).
-    Where the vocal is absent (gate closed or bins below threshold) the instrument
-    bins pass through unchanged.
+    The per-bin gain applied to the instruments is always limited to the band-pass range:
+    `bandMask` holds the magnitude response of the vocal band-pass filter at every bin, and
+    the ducking at a bin is scaled by it, so frequencies outside the filter band are never ducked.
+
+    Mode::vocalMask   The (band-passed, gated) vocal is analysed. Bins whose level is above the
+                      bin threshold form the mask; instrument bins under the mask are cut by up
+                      to maxCutDb. `invert` flips the mask (duck where the vocal is NOT).
+    Mode::fixedBand   No vocal analysis. The band selected by the band-pass filter is cut by
+                      `bandGain` (a linear gain set per sample from the measured band power).
+
+    The gain of every bin is published in `displayGainDb` for the GUI.
 
     Latency = fftSize samples (reported to the host by the plugin).
 */
@@ -25,6 +32,8 @@ public:
     static constexpr int numBins = fftSize / 2 + 1;
     static constexpr int latencySamples = fftSize;
 
+    enum class Mode { vocalMask, fixedBand };
+
     SpectralDucker() : fft (fftOrder)
     {
         float sumSq = 0.0f;
@@ -34,6 +43,7 @@ public:
             sumSq += window[(size_t) i] * window[(size_t) i];
         }
         outputScale = (float) hopSize / sumSq;   // = 1 / 1.5 for Hann @ 75 % overlap
+        bandMask.fill (1.0f);
         prepare (48000.0);
         reset();
     }
@@ -50,16 +60,27 @@ public:
         for (auto& b : inBuf)  b.fill (0.0f);
         for (auto& b : outBuf) b.fill (0.0f);
         mask.fill (0.0f);
+        for (auto& d : displayGainDb) d.store (0.0f, std::memory_order_relaxed);
         writePos = 0;
         hopCounter = 0;
     }
 
-    void setParameters (float binThresholdDbIn, float amountIn, float maxCutDbIn)
+    void setMode (Mode m) noexcept { mode = m; }
+
+    /** vocalMask mode: bin threshold (dB), amount (0..1), deepest cut (dB), invert the mask. */
+    void setParameters (float binThresholdDbIn, float amountIn, float maxCutDbIn, bool invertIn)
     {
         binThresholdDb = binThresholdDbIn;
         amount = amountIn;
         minGain = juce::Decibels::decibelsToGain (-maxCutDbIn);
+        invert = invertIn;
     }
+
+    /** Magnitude response (0..1) of the band-pass filter at each of the numBins bins. */
+    void setBandMask (const float* m) { std::copy (m, m + numBins, bandMask.begin()); }
+
+    /** fixedBand mode: linear gain applied inside the band (1 = no ducking). */
+    void setBandGain (float g) noexcept { bandGain = g; }
 
     /** Current gain of the vocal noise gate (0..1). Scales the vocal-presence mask. */
     void setGate (float g) noexcept { gateGain = g; }
@@ -84,6 +105,9 @@ public:
         }
     }
 
+    /** Per-bin gain in dB (<= 0), updated every frame, for the GUI. */
+    std::array<std::atomic<float>, numBins> displayGainDb {};
+
 private:
     void gather (const std::array<float, fftSize>& src, std::array<float, fftSize * 2>& dst) const noexcept
     {
@@ -95,41 +119,57 @@ private:
 
     void processFrame() noexcept
     {
-        gather (inBuf[0], vocalData);
         gather (inBuf[1], instData[0]);
         gather (inBuf[2], instData[1]);
 
-        fft.performRealOnlyForwardTransform (vocalData.data(), false);
         fft.performRealOnlyForwardTransform (instData[0].data(), false);
         fft.performRealOnlyForwardTransform (instData[1].data(), false);
 
-        // 1) Which bins does the vocal occupy?
-        const float refMag = (float) fftSize * 0.25f;   // magnitude of a full-scale sine with a Hann window
-        constexpr float kneeDb = 12.0f;
-
-        for (int k = 0; k < numBins; ++k)
+        if (mode == Mode::vocalMask)
         {
-            const float re = vocalData[(size_t) (2 * k)];
-            const float im = vocalData[(size_t) (2 * k + 1)];
-            const float mag = std::sqrt (re * re + im * im) / refMag;
-            const float db = 20.0f * std::log10 (std::max (mag, 1.0e-9f));
-            const float presence = juce::jlimit (0.0f, 1.0f, (db - (binThresholdDb - kneeDb * 0.5f)) / kneeDb);
-            target[(size_t) k] = presence * gateGain;
+            gather (inBuf[0], vocalData);
+            fft.performRealOnlyForwardTransform (vocalData.data(), false);
+
+            // 1) Which bins does the vocal occupy?
+            const float refMag = (float) fftSize * 0.25f;   // magnitude of a full-scale sine with a Hann window
+            constexpr float kneeDb = 12.0f;
+
+            for (int k = 0; k < numBins; ++k)
+            {
+                const float re = vocalData[(size_t) (2 * k)];
+                const float im = vocalData[(size_t) (2 * k + 1)];
+                const float mag = std::sqrt (re * re + im * im) / refMag;
+                const float db = 20.0f * std::log10 (std::max (mag, 1.0e-9f));
+                const float presence = juce::jlimit (0.0f, 1.0f, (db - (binThresholdDb - kneeDb * 0.5f)) / kneeDb);
+                target[(size_t) k] = presence * gateGain;
+            }
+
+            // 2) Smooth across frequency and time, optionally invert, limit to the band-pass range
+            for (int k = 0; k < numBins; ++k)
+            {
+                const float a = target[(size_t) std::max (k - 1, 0)];
+                const float b = target[(size_t) k];
+                const float c = target[(size_t) std::min (k + 1, numBins - 1)];
+                const float sm = 0.25f * (a + 2.0f * b + c);
+
+                float& m = mask[(size_t) k];
+                m += (sm > m ? riseCoef : fallCoef) * (sm - m);
+
+                const float used = invert ? 1.0f - m : m;
+                binGain[(size_t) k] = 1.0f - amount * used * bandMask[(size_t) k] * (1.0f - minGain);
+            }
+        }
+        else
+        {
+            // Fixed band: duck only the frequencies passed by the band-pass filter
+            for (int k = 0; k < numBins; ++k)
+                binGain[(size_t) k] = 1.0f - (1.0f - bandGain) * bandMask[(size_t) k];
         }
 
-        // 2) Smooth across frequency and time, then turn into a per-bin gain
+        // Publish for the GUI
         for (int k = 0; k < numBins; ++k)
-        {
-            const float a = target[(size_t) std::max (k - 1, 0)];
-            const float b = target[(size_t) k];
-            const float c = target[(size_t) std::min (k + 1, numBins - 1)];
-            const float sm = 0.25f * (a + 2.0f * b + c);
-
-            float& m = mask[(size_t) k];
-            m += (sm > m ? riseCoef : fallCoef) * (sm - m);
-
-            binGain[(size_t) k] = 1.0f - amount * m * (1.0f - minGain);
-        }
+            displayGainDb[(size_t) k].store (20.0f * std::log10 (std::max (binGain[(size_t) k], 1.0e-4f)),
+                                             std::memory_order_relaxed);
 
         // 3) Apply to both instrument channels (symmetric spectrum) and resynthesise
         for (auto& data : instData)
@@ -169,10 +209,12 @@ private:
     std::array<float, fftSize * 2> vocalData {};
     std::array<std::array<float, fftSize * 2>, 2> instData {};
 
-    std::array<float, numBins> target {}, mask {}, binGain {};
+    std::array<float, numBins> target {}, mask {}, binGain {}, bandMask {};
 
     int writePos = 0, hopCounter = 0;
 
-    float binThresholdDb = -55.0f, amount = 0.7f, minGain = 0.25f, gateGain = 0.0f;
+    Mode mode = Mode::vocalMask;
+    bool invert = false;
+    float binThresholdDb = -55.0f, amount = 0.7f, minGain = 0.25f, gateGain = 0.0f, bandGain = 1.0f;
     float riseCoef = 0.5f, fallCoef = 0.1f;
 };
